@@ -6,9 +6,15 @@ from fastdtw import fastdtw
 from filterpy.kalman import KalmanFilter
 import warnings
 from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
 import json
 import os
 import tempfile
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # 忽略protobuf兼容性警告
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
@@ -112,6 +118,7 @@ class PoseAnalyzer:
 
     def process_video(self, video_path):
         """处理视频并提取姿势数据"""
+        logger.info(f"开始处理视频: {video_path}")
         cap = cv2.VideoCapture(video_path)
         poses = []
         prev_valid = {}
@@ -146,10 +153,16 @@ class PoseAnalyzer:
                         current_pose[idx] = [float(x), float(y), float(lm.visibility)]
                 
                 poses.append(current_pose)
+        except Exception as e:
+            logger.error(f"处理视频时出错: {str(e)}")
+            raise
         finally:
             cap.release()
+            
+        logger.info(f"视频处理完成，共 {len(poses)} 帧")
         return poses
-    # ----------------------
+
+# ----------------------
 # 模块2：动作评估器
 # ----------------------
 class MotionEvaluator:
@@ -205,21 +218,17 @@ class MotionEvaluator:
 
     def analyze(self, user_poses, ref_poses, alignment):
         """分析用户动作与参考动作的差异"""
+        logger.info("开始动作分析")
         chain_scores = {chain: [] for chain in self.chains.keys()}
         
         for u_idx, r_idx in zip(alignment[0], alignment[1]):
             for chain_name, joint_names in self.chains.items():
-                # 获取关节索引
                 indices = HumanJoints.get_chain_indices(chain_name)
-                
-                # 提取用户和参考动作的关节点
                 user_points = [user_poses[u_idx].get(idx, (0,0,0))[:2] for idx in indices]
                 ref_points = [ref_poses[r_idx].get(idx, (0,0,0))[:2] for idx in indices]
                 
-                # 计算链的指标
                 metrics = self._calc_chain_metrics(user_points, ref_points)
                 if metrics:
-                    # 计算该链的综合得分
                     chain_score = 100 - (
                         metrics['angle_diff'] * 0.4 +
                         metrics['length_ratio'] * 100 * 0.3 +
@@ -227,7 +236,6 @@ class MotionEvaluator:
                     )
                     chain_scores[chain_name].append(max(0, min(100, chain_score)))
 
-        # 计算最终评分
         final_metrics = {}
         total_score = 0
         
@@ -235,11 +243,12 @@ class MotionEvaluator:
             if scores:
                 chain_avg = np.mean(scores)
                 final_metrics[chain_name] = {
-                    'score': float(chain_avg),  # 确保JSON可序列化
-                    'stability': float(np.std(scores)),  # 稳定性指标
+                    'score': float(chain_avg),
+                    'stability': float(np.std(scores)),
                 }
                 total_score += chain_avg * self.weights[chain_name]
 
+        logger.info("动作分析完成")
         return {
             'total_score': float(max(0, min(100, total_score))),
             'chain_metrics': final_metrics,
@@ -255,14 +264,12 @@ class DTWAligner:
         
     def align(self, user_poses, ref_poses):
         """使用DTW算法对齐两个姿势序列"""
-        # 将姿势转换为特征向量
+        logger.info("开始序列对齐")
         user_features = self._poses_to_features(user_poses)
         ref_features = self._poses_to_features(ref_poses)
         
-        # 计算DTW距离和路径
         _, path = fastdtw(user_features, ref_features)
-        
-        # 返回对齐索引
+        logger.info("序列对齐完成")
         return list(zip(*path))
     
     def _poses_to_features(self, poses):
@@ -272,7 +279,7 @@ class DTWAligner:
             feature = []
             for idx in HumanJoints.get_joint_indices():
                 if idx in pose:
-                    feature.extend(pose[idx][:2])  # 只使用x,y坐标
+                    feature.extend(pose[idx][:2])
                 else:
                     feature.extend([0, 0])
             features.append(feature)
@@ -282,11 +289,12 @@ class DTWAligner:
 # Flask应用
 # ----------------------
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # 配置上传文件夹
 UPLOAD_FOLDER = tempfile.mkdtemp()
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 限制16MB
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024  # 64MB
 
 def allowed_file(filename):
     """检查文件类型是否允许"""
@@ -300,16 +308,21 @@ def index():
 @app.route('/api/poses', methods=['POST'])
 def analyze_poses():
     """处理视频上传和分析请求"""
+    logger.info("收到新的分析请求")
+    
     if 'user_video' not in request.files or 'ref_video' not in request.files:
+        logger.error("未找到上传的视频文件")
         return jsonify({'error': '请上传两个视频文件'}), 400
     
     user_video = request.files['user_video']
     ref_video = request.files['ref_video']
     
     if not user_video or not ref_video:
+        logger.error("文件未选择")
         return jsonify({'error': '文件未选择'}), 400
     
     if not allowed_file(user_video.filename) or not allowed_file(ref_video.filename):
+        logger.error(f"不支持的文件格式: {user_video.filename}, {ref_video.filename}")
         return jsonify({'error': '不支持的文件格式'}), 400
 
     try:
@@ -317,6 +330,7 @@ def analyze_poses():
         user_path = os.path.join(app.config['UPLOAD_FOLDER'], 'user_temp.mp4')
         ref_path = os.path.join(app.config['UPLOAD_FOLDER'], 'ref_temp.mp4')
         
+        logger.info(f"保存视频文件到: {user_path}, {ref_path}")
         user_video.save(user_path)
         ref_video.save(ref_path)
         
@@ -333,6 +347,7 @@ def analyze_poses():
         evaluator = MotionEvaluator()
         report = evaluator.analyze(user_poses, ref_poses, alignment)
         
+        logger.info("分析完成，准备返回结果")
         return jsonify({
             'user_poses': user_poses,
             'ref_poses': ref_poses,
@@ -340,10 +355,12 @@ def analyze_poses():
         })
 
     except Exception as e:
+        logger.exception("处理过程中出现错误")
         return jsonify({'error': str(e)}), 500
         
     finally:
         # 清理临时文件
+        logger.info("清理临时文件")
         if os.path.exists(user_path):
             os.remove(user_path)
         if os.path.exists(ref_path):
@@ -361,4 +378,4 @@ def internal_error(e):
     return jsonify({'error': '服务器内部错误'}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
