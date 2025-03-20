@@ -207,9 +207,13 @@
 
             try {
                 console.log('开始上传视频...');
-                const response = await fetch('http://localhost:5000/api/poses', {
+                const response = await fetch('http://127.0.0.1:5000/api/poses', {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    headers: {
+                        'Accept': 'application/json',
+                    },
+                    credentials: 'omit'
                 });
 
                 console.log('服务器响应状态:', response.status);
